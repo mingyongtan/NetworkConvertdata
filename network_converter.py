@@ -233,6 +233,7 @@ def write_sheets_to_excel(output_path: str, sheets: List[Tuple[str, pd.DataFrame
     from openpyxl.worksheet.table import Table as _Table, TableStyleInfo as _TSI
     from openpyxl import load_workbook as _lb
 
+    # First write sheets with pandas
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         used = set()
         for sheet_name, df in sheets:
@@ -243,25 +244,77 @@ def write_sheets_to_excel(output_path: str, sheets: List[Tuple[str, pd.DataFrame
             used.add(name)
             df.to_excel(writer, index=False, sheet_name=name)
 
+    # Re-open and add the three computed columns + create Table
     wb = _lb(output_path)
     for ws in wb.worksheets:
+        # Identify header row and find the Packets column (accept 'Packet' or 'Packets')
+        headers = [cell.value if cell.value is not None else "" for cell in ws[1]]
+        norm = [NORMALIZE(str(h)) for h in headers]
+        pkt_idx = None
+        for i, h in enumerate(norm, start=1):
+            if h in ("packets", "packet"):
+                pkt_idx = i
+                break
+        if pkt_idx is None:
+            # no packets column? skip augmenting this sheet
+            max_row = ws.max_row
+            max_col = ws.max_column
+            if max_row >= 2 and max_col >= 1:
+                ref = f"A1:{_gcl(max_col)}{max_row}"
+                disp = re.sub(r"[^A-Za-z0-9_]", "_", f"T_{ws.title}")[:31]
+                t = _Table(displayName=disp, ref=ref)
+                t.tableStyleInfo = _TSI(name="TableStyleMedium9", showRowStripes=True)
+                ws.add_table(t)
+                ws.freeze_panes = "A2"
+            continue
+
         max_row = ws.max_row
         max_col = ws.max_column
-        if max_row >= 2 and max_col >= 1:
-            ref = f"A1:{_gcl(max_col)}{max_row}"
-            disp = re.sub(r"[^A-Za-z0-9_]", "_", f"T_{ws.title}")[:31]
-            t = _Table(displayName=disp, ref=ref)
-            t.tableStyleInfo = _TSI(name="TableStyleMedium9", showRowStripes=True)
-            ws.add_table(t)
-            ws.freeze_panes = "A2"
-            # crude autofit
-            for i in range(1, max_col + 1):
-                col = _gcl(i)
-                max_len = 0
-                for cell in ws[col]:
-                    val = cell.value
-                    max_len = max(max_len, len(str(val)) if val is not None else 0)
-                ws.column_dimensions[col].width = min(max(10, int(max_len * 1.05)), 60)
+
+        # New columns appended to the right
+        col_total = max_col + 1
+        col_pct   = max_col + 2
+        col_top20 = max_col + 3
+
+        ws.cell(row=1, column=col_total, value="Total Packets")
+        ws.cell(row=1, column=col_pct,   value="Total Packets in 100% (B/D *100)")
+        ws.cell(row=1, column=col_top20, value="Top 20 %")
+
+        pkt_letter = _gcl(pkt_idx)
+        total_letter = _gcl(col_total)
+
+        # Build formulas
+        total_sum_formula = f"=SUM(${pkt_letter}$2:${pkt_letter}${max_row})"
+        for r in range(2, max_row + 1):
+            # Total Packets =SUM([Packets])  → use absolute SUM over column
+            ws.cell(row=r, column=col_total).value = total_sum_formula
+            # Total Packets in 100% (B/D *100) → use row-wise Packets/Total * 100
+            cell_pct = ws.cell(row=r, column=col_pct)
+            cell_pct.value = f"=({pkt_letter}{r}/{total_letter}{r})*100"
+            cell_pct.number_format = '0.00'
+            # Top 20 % → leave blank as requested
+
+        # Create/resize the table to include new columns
+        new_max_col = ws.max_column
+        ref = f"A1:{_gcl(new_max_col)}{max_row}"
+        disp = re.sub(r"[^A-Za-z0-9_]", "_", f"T_{ws.title}")[:31]
+        # Remove any existing table with the same name before re-adding
+        if disp in ws.tables:
+            del ws.tables[disp]
+        t = _Table(displayName=disp, ref=ref)
+        t.tableStyleInfo = _TSI(name="TableStyleMedium9", showRowStripes=True)
+        ws.add_table(t)
+        ws.freeze_panes = "A2"
+
+        # crude autofit for all columns (including new ones)
+        for i in range(1, new_max_col + 1):
+            col_letter = _gcl(i)
+            max_len = 0
+            for cell in ws[col_letter]:
+                val = cell.value
+                max_len = max(max_len, len(str(val)) if val is not None else 0)
+            ws.column_dimensions[col_letter].width = min(max(10, int(max_len * 1.05)), 60)
+
     wb.save(output_path)
 
 # -------------------------
