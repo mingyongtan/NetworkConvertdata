@@ -1,292 +1,578 @@
-"""GUI tool to convert network raw data text files to XLSX tables."""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+network_parse.py — TXT ➜ XLSX network stats converter (GUI + CLI)
 
+New in this revision
+--------------------
+- **Correct CSV handling**: Wireshark exports are comma-separated with quotes.
+  The parser now uses Python's `csv` to read commas/tabs/semicolons correctly
+  (no more whole-row-in-column A issues). Headers are preserved exactly as in
+  the file (e.g., `AS Number`, `AS Organization`).
+- Header detection no longer guesses: we trust the first parsed row as header
+  after skipping an optional protocol label line (`Ethernet`, `IPv4`, `IPv6`,
+  `TCP`, `UDP`).
+- Numeric coercion by column name (Packets/Bytes/Port/Latitude/Longitude),
+  but without rewriting header titles.
+- Empty-file UX unchanged; GUI auto-opens on empty in CLI (`--on-empty gui`).
+- **More tests**: added CSV-based Wireshark samples (with quotes + geo/ASN
+  columns) to guarantee proper columnization.
+- **IPv4/IPv6 geo drop**: For IPv4 and IPv6 sheets, the following columns are
+  now removed automatically on export: `Country`, `City`, `Latitude`,
+  `Longitude`, `AS Number`, `AS Organization`. Use of GUI/CLI is unchanged.
+- **TCP/UDP port drop**: For TCP and UDP sheets, the `Port` column is removed
+  automatically during conversion.
+
+Supported inputs: Ethernet / IPv4 / IPv6 / TCP / UDP dumps with headers.
+Writes an Excel workbook with one sheet per protocol (real Excel Tables).
+
+Usage
+-----
+# GUI (click-pick files)
+python network_parse.py --gui
+
+# CLI — convert current folder
+python network_parse.py
+
+# CLI — specific folder or files (globs OK)
+python network_parse.py /path/to/folder -o /path/to/out.xlsx
+python network_parse.py data/*.txt -o network.xlsx
+
+# Preview only / self-test
+python network_parse.py --list-only data/
+python network_parse.py --selftest
+
+Dependencies: pandas, openpyxl
+   pip install pandas openpyxl
+"""
 from __future__ import annotations
 
-import pathlib
+import argparse
+import os
 import re
-from dataclasses import dataclass
-from typing import Dict, List, Sequence
+import sys
+import glob
+import csv
+import tempfile
+import shutil
+from typing import Dict, List, Optional, Tuple
 
-from openpyxl import Workbook
-from openpyxl.utils import get_column_letter
-from tkinter import filedialog, messagebox, Tk, ttk, StringVar
+try:
+    import pandas as pd
+except ImportError as e:
+    raise SystemExit("This tool needs pandas. Install with: pip install pandas openpyxl") from e
 
+# -------------------------
+# Helpers / constants
+# -------------------------
+PROTO_NAMES = {"ethernet", "ipv4", "ipv6", "tcp", "udp"}
+GEO_DROP_COLS = [
+    "Country", "City", "Latitude", "Longitude", "AS Number", "AS Organization",
+]
 
-@dataclass(frozen=True)
-class SectionDefinition:
-    """Describes the expected headers for a section in the raw data."""
+def NORMALIZE(s: Optional[str]) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (s or "").strip().lower())
 
-    name: str
-    headers: Sequence[str]
+# -------------------------
+# Parsing
+# -------------------------
 
-    @property
-    def normalized_name(self) -> str:
-        """Return a sanitized sheet name for use in Excel workbooks."""
-
-        sanitized = re.sub(r"[^0-9A-Za-z ]", "", self.name)
-        sanitized = sanitized.strip() or "Sheet"
-        # Excel sheet names are limited to 31 characters
-        return sanitized[:31]
-
-
-SECTION_DEFINITIONS: Dict[str, SectionDefinition] = {
-    "Ethernet": SectionDefinition(
-        name="Ethernet",
-        headers=(
-            "Address",
-            "Port",
-            "Packets",
-            "Bytes",
-            "Tx Packets",
-            "Tx Bytes",
-            "Rx Packets",
-            "Rx Bytes",
-        ),
-    ),
-    "IPv4": SectionDefinition(
-        name="IPv4",
-        headers=(
-            "Address",
-            "Packets",
-            "Bytes",
-            "Tx Packets",
-            "Tx Bytes",
-            "Rx Packets",
-            "Rx Bytes",
-        ),
-    ),
-    "IPv6": SectionDefinition(
-        name="IPv6",
-        headers=(
-            "Address",
-            "Packets",
-            "Bytes",
-            "Tx Packets",
-            "Tx Bytes",
-            "Rx Packets",
-            "Rx Bytes",
-        ),
-    ),
-    "TCP": SectionDefinition(
-        name="TCP",
-        headers=(
-            "Address",
-            "Port",
-            "Packets",
-            "Bytes",
-            "Tx Packets",
-            "Tx Bytes",
-            "Rx Packets",
-            "Rx Bytes",
-        ),
-    ),
-    "UDP": SectionDefinition(
-        name="UDP",
-        headers=(
-            "Address",
-            "Port",
-            "Packets",
-            "Bytes",
-            "Tx Packets",
-            "Tx Bytes",
-            "Rx Packets",
-            "Rx Bytes",
-        ),
-    ),
-}
+def _maybe_drop_proto_label(lines: List[str]) -> List[str]:
+    clean = [ln.rstrip("\r\n") for ln in lines]
+    # drop leading empties
+    while clean and not clean[0].strip():
+        clean.pop(0)
+    if clean and NORMALIZE(clean[0]) in PROTO_NAMES and "," not in clean[0] and "\t" not in clean[0]:
+        return clean[1:]
+    return clean
 
 
-class RawNetworkDataParser:
-    """Parse raw network telemetry text files into structured tables."""
+def _csv_parse(lines: List[str]) -> Tuple[List[str], List[List[str]], str]:
+    """Return (header, rows, delimiter). Prefers csv.Sniffer, falls back."""
+    data = _maybe_drop_proto_label(lines)
+    # Remove blank lines; keep content otherwise
+    nonempty = [ln for ln in data if ln.strip()]
+    if not nonempty:
+        return [], [], ","
 
-    def __init__(self, section_definitions: Dict[str, SectionDefinition] | None = None) -> None:
-        self._definitions = section_definitions or SECTION_DEFINITIONS
+    sample = "\n".join(nonempty[: min(50, len(nonempty))])
+    try:
+        sniff = csv.Sniffer().sniff(sample, delimiters=",\t;|")
+        delim = sniff.delimiter
+    except Exception:
+        # heuristic: if comma appears a lot, choose comma; else tab; else spaces
+        counts = {d: sample.count(d) for d in [",", "\t", ";", "|"]}
+        delim = max(counts, key=counts.get) if max(counts.values()) > 0 else ","
 
-    @property
-    def definitions(self) -> Dict[str, SectionDefinition]:
-        return self._definitions
+    reader = csv.reader(nonempty, delimiter=delim)
+    try:
+        header = next(reader)
+    except StopIteration:
+        return [], [], delim
 
-    def parse(self, text: str) -> Dict[str, List[List[str]]]:
-        """Parse raw text into a mapping of section name to table rows."""
+    # strip BOM and whitespace
+    if header:
+        header[0] = header[0].lstrip("\ufeff").strip()
+        header = [h.strip() for h in header]
 
-        tables: Dict[str, List[List[str]]] = {}
-        current_section: SectionDefinition | None = None
+    rows: List[List[str]] = []
+    for row in reader:
+        # pad/truncate to header len
+        if len(row) < len(header):
+            row = row + ["" for _ in range(len(header) - len(row))]
+        elif len(row) > len(header):
+            row = row[: len(header)]
+        rows.append([c.strip() for c in row])
 
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-
-            normalized = line.rstrip(":")
-            definition = self._definitions.get(normalized)
-            if definition is not None:
-                current_section = definition
-                tables.setdefault(current_section.name, [])
-                continue
-
-            if current_section is None:
-                # Line does not belong to a known section; ignore it for now.
-                continue
-
-            if self._is_header_line(line, current_section.headers):
-                continue
-
-            row = self._tokenize_row(line, len(current_section.headers))
-            tables.setdefault(current_section.name, []).append(row)
-
-        return tables
-
-    @staticmethod
-    def _is_header_line(line: str, headers: Sequence[str]) -> bool:
-        """Check whether the line matches the expected header names."""
-
-        normalized_line = re.sub(r"\s+", " ", line.strip()).lower()
-        normalized_headers = " ".join(headers).lower()
-        return normalized_line == normalized_headers
-
-    @staticmethod
-    def _tokenize_row(line: str, expected_columns: int) -> List[str]:
-        tokens = line.split()
-        if len(tokens) < expected_columns:
-            tokens.extend([""] * (expected_columns - len(tokens)))
-        elif len(tokens) > expected_columns:
-            # Merge trailing tokens into the last column.
-            tokens = tokens[: expected_columns - 1] + [" ".join(tokens[expected_columns - 1 :])]
-        return tokens
+    return header, rows, delim
 
 
-def export_tables_to_workbook(
-    tables: Dict[str, List[List[str]]],
-    output_path: pathlib.Path,
-    section_definitions: Dict[str, SectionDefinition] | None = None,
-) -> None:
-    """Create an XLSX workbook from parsed tables."""
+def detect_header_and_rows(lines: List[str]) -> Tuple[Optional[List[str]], List[List[str]]]:
+    """Parse with CSV first; if that yields a header, return it; otherwise fall back."""
+    header, rows, _ = _csv_parse(lines)
+    if header:
+        return header, rows
 
-    definitions = section_definitions or SECTION_DEFINITIONS
-    workbook = Workbook()
-    # Remove default sheet created by openpyxl
-    default_sheet = workbook.active
-    workbook.remove(default_sheet)
+    # Fallback to old splitter (tabs/2+ spaces)
+    clean = [ln.strip("\r\n") for ln in lines if ln.strip()]
+    if not clean:
+        return None, []
 
-    for section_name, rows in tables.items():
-        definition = definitions.get(section_name)
-        if definition is None:
+    if NORMALIZE(clean[0]) in PROTO_NAMES:
+        clean = clean[1:]
+
+    parts0 = re.split(r"\s{2,}|\t", clean[0].strip())
+    if len(parts0) >= 3:  # looks like header-ish
+        header = [p.strip() for p in parts0]
+        rows = [re.split(r"\s{2,}|\t", ln.strip()) for ln in clean[1:]]
+        return header, rows
+
+    # Last resort: treat all lines as data (single column)
+    return None, [[x] for x in clean]
+
+
+def to_dataframe(header: Optional[List[str]], rows: List[List[str]], expected_cols: Optional[List[str]] = None) -> pd.DataFrame:
+    """Build a DataFrame. If a header is provided, we **use it as-is**.
+    If no header, use expected_cols (if provided) or infer width from data.
+    """
+    if header:
+        df = pd.DataFrame(rows, columns=header)
+    else:
+        if not rows:
+            return pd.DataFrame(columns=(expected_cols or []))
+        width = max((len(r) for r in rows), default=1)
+        cols = (expected_cols[:width] if expected_cols else [f"Col{i+1}" for i in range(width)])
+        df = pd.DataFrame(rows, columns=cols)
+
+    # Coerce numeric types by column name
+    NUMERIC_COLS = {
+        "packets", "bytes", "txpackets", "txbytes", "rxpackets", "rxbytes",
+        "port", "latitude", "longitude", "asnumber",
+    }
+    for c in df.columns:
+        if NORMALIZE(c) in NUMERIC_COLS:
+            df[c] = pd.to_numeric(df[c].replace({"": pd.NA}), errors="coerce")
+
+    return df
+
+
+def parse_file(path: str) -> Tuple[str, pd.DataFrame]:
+    """Parse a single .txt/.csv file and return (sheet_name, DataFrame)."""
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+
+    # Pick sheet name from filename (fallback to generic)
+    basename = os.path.basename(path).lower()
+    DISPLAY_NAME = {"ethernet": "Ethernet", "ipv4": "IPv4", "ipv6": "IPv6", "tcp": "TCP", "udp": "UDP"}
+    proto = None
+    for key, disp in DISPLAY_NAME.items():
+        if key in basename:
+            proto = disp
+            break
+    if proto is None:
+        proto = "Sheet"
+
+    header, rows = detect_header_and_rows(lines)
+    df = to_dataframe(header, rows, expected_cols=None)
+
+    # For IPv4/IPv6, drop Geo/ASN columns if present
+    if proto in ("IPv4", "IPv6"):
+        drop_cols = [c for c in GEO_DROP_COLS if c in df.columns]
+        if drop_cols:
+            df = df[[c for c in df.columns if c not in drop_cols]]
+
+    # For TCP/UDP, drop Port column if present (case-insensitive guard)
+    if proto in ("TCP", "UDP"):
+        port_cols = [c for c in df.columns if NORMALIZE(c) == "port"]
+        if port_cols:
+            df = df[[c for c in df.columns if c not in port_cols]]
+
+    return proto, df
+
+
+def parse_folder(folder: str, recursive: bool = False, pattern: str = "*.txt") -> List[Tuple[str, pd.DataFrame]]:
+    search = os.path.join(folder, "**", pattern) if recursive else os.path.join(folder, pattern)
+    files = sorted(glob.glob(search, recursive=recursive))
+    if not files:
+        return []
+    sheets: List[Tuple[str, pd.DataFrame]] = []
+    for p in files:
+        if not os.path.isfile(p):
             continue
+        sheet, df = parse_file(p)
+        if not df.empty:
+            sheets.append((sheet, df))
+    return sheets
 
-        sheet = workbook.create_sheet(definition.normalized_name)
-        sheet.append(list(definition.headers))
+# -------------------------
+# Excel writing
+# -------------------------
 
-        for row in rows:
-            sheet.append(row)
+def write_sheets_to_excel(output_path: str, sheets: List[Tuple[str, pd.DataFrame]]) -> None:
+    from openpyxl.utils import get_column_letter as _gcl
+    from openpyxl.worksheet.table import Table as _Table, TableStyleInfo as _TSI
+    from openpyxl import load_workbook as _lb
 
-        _autosize_columns(sheet)
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        used = set()
+        for sheet_name, df in sheets:
+            name = sheet_name
+            k = 2
+            while name in used:
+                name = f"{sheet_name}_{k}"; k += 1
+            used.add(name)
+            df.to_excel(writer, index=False, sheet_name=name)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    workbook.save(output_path)
+    wb = _lb(output_path)
+    for ws in wb.worksheets:
+        max_row = ws.max_row
+        max_col = ws.max_column
+        if max_row >= 2 and max_col >= 1:
+            ref = f"A1:{_gcl(max_col)}{max_row}"
+            disp = re.sub(r"[^A-Za-z0-9_]", "_", f"T_{ws.title}")[:31]
+            t = _Table(displayName=disp, ref=ref)
+            t.tableStyleInfo = _TSI(name="TableStyleMedium9", showRowStripes=True)
+            ws.add_table(t)
+            ws.freeze_panes = "A2"
+            # crude autofit
+            for i in range(1, max_col + 1):
+                col = _gcl(i)
+                max_len = 0
+                for cell in ws[col]:
+                    val = cell.value
+                    max_len = max(max_len, len(str(val)) if val is not None else 0)
+                ws.column_dimensions[col].width = min(max(10, int(max_len * 1.05)), 60)
+    wb.save(output_path)
+
+# -------------------------
+# GUI
+# -------------------------
+
+def run_gui() -> int:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox, ttk
+    except Exception as e:
+        print("GUI unavailable:", e)
+        return 2
+
+    class App(tk.Tk):
+        def __init__(self):
+            super().__init__()
+            self.title("TXT → XLSX (Network Converter)")
+            self.geometry("760x520")
+            self.minsize(660, 460)
+            self.selected_paths: List[str] = []
+            self._build_ui()
+
+        def _build_ui(self):
+            pad = {"padx": 10, "pady": 8}
+
+            frm_top = ttk.Frame(self); frm_top.pack(fill="x", **pad)
+            ttk.Label(frm_top, text="1) Pick .txt files or a folder with them").pack(anchor="w")
+            btns = ttk.Frame(frm_top); btns.pack(fill="x", pady=4)
+            ttk.Button(btns, text="Select .txt files", command=self.on_pick_files).pack(side="left")
+            ttk.Button(btns, text="Select folder", command=self.on_pick_folder).pack(side="left", padx=8)
+            ttk.Button(btns, text="Clear list", command=self.on_clear).pack(side="left")
+
+            self.lst = tk.Listbox(self, height=8); self.lst.pack(fill="both", expand=False, **pad)
+
+            frm_out = ttk.Frame(self); frm_out.pack(fill="x", **pad)
+            ttk.Label(frm_out, text="2) Output workbook (.xlsx):").pack(anchor="w")
+            self.out_entry = ttk.Entry(frm_out)
+            default_out = os.path.join(os.path.expanduser("~"), "Desktop", "network_data.xlsx")
+            try: self.out_entry.insert(0, default_out)
+            except Exception: self.out_entry.insert(0, os.path.abspath("network_data.xlsx"))
+            self.out_entry.pack(fill="x")
+            ttk.Button(frm_out, text="Browse...", command=self.on_pick_output).pack(anchor="e", pady=6)
+
+            frm_run = ttk.Frame(self); frm_run.pack(fill="x", **pad)
+            ttk.Button(frm_run, text="Convert →", command=self.on_convert).pack(side="left")
+            ttk.Button(frm_run, text="Quit", command=self.destroy).pack(side="right")
+
+            ttk.Separator(self).pack(fill="x", pady=6)
+            ttk.Label(self, text="Log:").pack(anchor="w", padx=10)
+            self.log = tk.Text(self, height=12); self.log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        def logln(self, msg: str):
+            self.log.insert("end", msg + "\n"); self.log.see("end"); self.update_idletasks()
+
+        def refresh_listbox(self):
+            self.lst.delete(0, "end")
+            for p in self.selected_paths: self.lst.insert("end", p)
+
+        def on_pick_files(self):
+            paths = filedialog.askopenfilenames(title="Select .txt files", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+            if not paths: return
+            self.selected_paths.extend(list(paths))
+            self.selected_paths = list(dict.fromkeys(self.selected_paths))
+            self.refresh_listbox()
+
+        def on_pick_folder(self):
+            folder = filedialog.askdirectory(title="Select folder with .txt files")
+            if not folder: return
+            found = sorted(glob.glob(os.path.join(folder, "*.txt")))
+            if not found:
+                messagebox.showinfo("No .txt files", "That folder has no .txt files."); return
+            self.selected_paths.extend(found)
+            self.selected_paths = list(dict.fromkeys(self.selected_paths))
+            self.refresh_listbox()
+
+        def on_clear(self):
+            self.selected_paths = []; self.refresh_listbox()
+
+        def on_pick_output(self):
+            initial = self.out_entry.get().strip() or "network_data.xlsx"
+            path = filedialog.asksaveasfilename(title="Save Excel workbook", defaultextension=".xlsx", initialfile=os.path.basename(initial), filetypes=[("Excel Workbook", "*.xlsx")])
+            if path:
+                if not path.lower().endswith(".xlsx"): path += ".xlsx"
+                self.out_entry.delete(0, "end"); self.out_entry.insert(0, path)
+
+        def on_convert(self):
+            if not self.selected_paths:
+                messagebox.showwarning("No files", "Add some .txt files first."); return
+            out = self.out_entry.get().strip()
+            if not out:
+                messagebox.showwarning("No output", "Enter an output .xlsx path."); return
+
+            sheets: List[Tuple[str, pd.DataFrame]] = []
+            ok = 0
+            for p in self.selected_paths:
+                try:
+                    proto, df = parse_file(p)
+                    if df.empty:
+                        self.logln(f"⚠️ {os.path.basename(p)} → parsed 0 rows (skipped)"); continue
+                    sheets.append((proto, df))
+                    self.logln(f"✅ {os.path.basename(p)} → '{proto}' with {len(df)} rows"); ok += 1
+                except Exception as e:
+                    self.logln(f"❌ {os.path.basename(p)} → {e}")
+
+            if not sheets:
+                messagebox.showerror("Nothing to write", "No data was parsed from the selected files."); return
+
+            try:
+                write_sheets_to_excel(out, sheets)
+                self.logln(f"💾 Saved workbook → {out}")
+                messagebox.showinfo("Done", f"Converted {ok} file(s).\nSaved to:\n{out}")
+            except Exception as e:
+                self.logln(f"❌ Failed to save workbook → {e}"); messagebox.showerror("Save failed", str(e))
+
+    if sys.platform.startswith("win"):
+        try:
+            from ctypes import windll
+            windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+
+    app = App(); app.mainloop(); return 0
+
+# -------------------------
+# CLI
+# -------------------------
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Convert network .txt files to an Excel workbook",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python network_parse.py                # current folder -> network_data.xlsx\n"
+            "  python network_parse.py --gui         # launch GUI\n"
+            "  python network_parse.py data/ -o out.xlsx\n"
+            "  python network_parse.py data/*.txt -o out.xlsx\n"
+            "  python network_parse.py --list-only data/\n"
+            "  python network_parse.py --selftest\n"
+        ),
+    )
+
+    p.add_argument("inputs", nargs="*", help="Folder path (converts *.txt) OR one or more .txt files (globs OK). Default: .", default=["."])
+    p.add_argument("-o", "--output", default="network_data.xlsx", help="Output .xlsx path (default: network_data.xlsx)")
+    p.add_argument("-r", "--recursive", action="store_true", help="Recurse into subdirectories when a folder is provided.")
+    p.add_argument("-p", "--pattern", default="*.txt", help="Glob pattern to match files inside folders (default: *.txt)")
+    p.add_argument("--list-only", action="store_true", help="List files that would be parsed and exit (no Excel writing)")
+    p.add_argument("--selftest", action="store_true", help="Run built-in tests (creates temporary input files, checks output)")
+    p.add_argument("--on-empty", choices=["gui", "recursive", "error", "selftest", "noop"], default="gui", help=(
+        "What to do if no files are found: \n"
+        "  gui       = open a file picker (default)\n"
+        "  recursive = retry search with --recursive and proceed if found\n"
+        "  error     = print a brief message and exit 2\n"
+        "  selftest  = run built-in test and exit 0\n"
+        "  noop      = print a notice and exit 0\n"
+    ))
+    p.add_argument("--gui", action="store_true", help="Launch the Tkinter GUI instead of CLI")
+    return p
 
 
-def _autosize_columns(sheet) -> None:
-    """Adjust column widths based on the longest cell in each column."""
-
-    for column_cells in sheet.columns:
-        max_length = 0
-        column_index = column_cells[0].column
-        for cell in column_cells:
-            if cell.value:
-                max_length = max(max_length, len(str(cell.value)))
-        adjusted_width = max_length + 2
-        sheet.column_dimensions[get_column_letter(column_index)].width = adjusted_width
-
-
-class ConverterGUI:
-    """Simple Tk GUI around the raw data parser and XLSX exporter."""
-
-    def __init__(self) -> None:
-        self.root = Tk()
-        self.root.title("Network Data Converter")
-
-        self.parser = RawNetworkDataParser()
-
-        self.input_path_var = StringVar()
-        self.output_path_var = StringVar()
-
-        self._build_layout()
-
-    def _build_layout(self) -> None:
-        padding = {"padx": 10, "pady": 10}
-
-        frame = ttk.Frame(self.root)
-        frame.grid(column=0, row=0, sticky="nsew")
-
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-        frame.columnconfigure(1, weight=1)
-
-        ttk.Label(frame, text="Input TXT file:").grid(column=0, row=0, sticky="w", **padding)
-        input_entry = ttk.Entry(frame, textvariable=self.input_path_var, width=50)
-        input_entry.grid(column=1, row=0, sticky="ew", **padding)
-        ttk.Button(frame, text="Browse", command=self._browse_input).grid(column=2, row=0, **padding)
-
-        ttk.Label(frame, text="Output XLSX file:").grid(column=0, row=1, sticky="w", **padding)
-        output_entry = ttk.Entry(frame, textvariable=self.output_path_var, width=50)
-        output_entry.grid(column=1, row=1, sticky="ew", **padding)
-        ttk.Button(frame, text="Browse", command=self._browse_output).grid(column=2, row=1, **padding)
-
-        convert_button = ttk.Button(frame, text="Convert", command=self._convert)
-        convert_button.grid(column=0, row=2, columnspan=3, pady=(20, 10))
-
-    def _browse_input(self) -> None:
-        initial_dir = pathlib.Path(self.input_path_var.get() or ".").expanduser()
-        file_path = filedialog.askopenfilename(
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-            initialdir=str(initial_dir),
-        )
-        if file_path:
-            self.input_path_var.set(file_path)
-            if not self.output_path_var.get():
-                suggested = pathlib.Path(file_path).with_suffix(".xlsx")
-                self.output_path_var.set(str(suggested))
-
-    def _browse_output(self) -> None:
-        initial_file = self.output_path_var.get() or "converted.xlsx"
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=".xlsx",
-            filetypes=[("Excel Workbook", "*.xlsx")],
-            initialfile=initial_file,
-        )
-        if file_path:
-            self.output_path_var.set(file_path)
-
-    def _convert(self) -> None:
-        input_path = pathlib.Path(self.input_path_var.get())
-        output_path = pathlib.Path(self.output_path_var.get())
-
-        if not input_path.exists():
-            messagebox.showerror("Conversion Failed", f"Input file not found: {input_path}")
-            return
-
-        if not output_path.suffix:
-            output_path = output_path.with_suffix(".xlsx")
-
-        text = input_path.read_text(encoding="utf-8")
-        tables = self.parser.parse(text)
-        if not tables:
-            messagebox.showwarning(
-                "No Data Found",
-                "The input file did not contain any recognized sections to convert.",
-            )
-            return
-
-        export_tables_to_workbook(tables, output_path, self.parser.definitions)
-        messagebox.showinfo("Conversion Complete", f"Saved workbook to {output_path}")
-
-    def run(self) -> None:
-        self.root.mainloop()
+def resolve_inputs(inputs: List[str], recursive: bool, pattern: str) -> List[Tuple[str, pd.DataFrame]]:
+    if len(inputs) == 1 and os.path.isdir(inputs[0]):
+        return parse_folder(inputs[0], recursive=recursive, pattern=pattern)
+    paths: List[str] = []
+    for it in inputs:
+        if os.path.isdir(it):
+            paths.extend(sorted(glob.glob(os.path.join(it, "**", pattern) if recursive else os.path.join(it, pattern), recursive=recursive)))
+        else:
+            matches = glob.glob(it); paths.extend(matches if matches else [it])
+    paths = [p for p in paths if os.path.isfile(p)]
+    if not paths: return []
+    sheets: List[Tuple[str, pd.DataFrame]] = []
+    for p in paths:
+        sheet, df = parse_file(p)
+        if not df.empty: sheets.append((sheet, df))
+    return sheets
 
 
-def main() -> None:
-    ConverterGUI().run()
+def _print_no_files_help(inputs: List[str], pattern: str, recursive: bool) -> None:
+    hint_dir = inputs[0] if inputs else "."; rec = " (searched subfolders)" if recursive else ""
+    print(f"No matching files found in: {hint_dir}{rec}  |  pattern: {pattern}")
+
+# -------------------------
+# Self-test (adds real test cases)
+# -------------------------
+
+def _write_sample_tabs(dir_: str) -> None:
+    samples = {
+        "Ethernet.txt": """Ethernet\nAddress\tPort\tPackets\tBytes\tTx Packets\tTx Bytes\tRx Packets\tRx Bytes\n10.0.0.2\t53\t420\t128000\t210\t64000\t210\t64000\n10.0.0.3\t80\t300\t96000\t150\t48000\t150\t48000\n""",
+        "IPv4.txt": """IPv4\nAddress\tPackets\tBytes\tTx Packets\tTx Bytes\tRx Packets\tRx Bytes\n172.16.0.5\t1000\t320000\t600\t200000\t400\t120000\n192.168.1.77\t250\t80000\t150\t48000\t100\t32000\n""",
+        "IPv6.txt": """IPv6\nAddress\tPackets\tBytes\tTx Packets\tTx Bytes\tRx Packets\tRx Bytes\n2001:db8::10\t900\t288000\t500\t160000\t400\t128000\nfe80::1\t120\t38000\t60\t19000\t60\t19000\n""",
+        "TCP.txt": """TCP\nAddress\tPort\tPackets\tBytes\tTx Packets\tTx Bytes\tRx Packets\tRx Bytes\n203.0.113.9\t443\t2000\t640000\t1200\t384000\t800\t256000\n198.51.100.44\t22\t300\t96000\t160\t51200\t140\t44800\n""",
+        "UDP.txt": """UDP\nAddress\tPort\tPackets\tBytes\tTx Packets\tTx Bytes\tRx Packets\tRx Bytes\n8.8.8.8\t53\t800\t256000\t500\t160000\t300\t96000\n224.0.0.251\t5353\t120\t38000\t80\t25000\t40\t13000\n""",
+    }
+    for name, content in samples.items():
+        with open(os.path.join(dir_, name), "w", encoding="utf-8") as f: f.write(content)
+
+
+def _write_sample_csv(dir_: str) -> None:
+    # CSV with quotes and geo/ASN columns (mirrors Wireshark export)
+    ipv4_csv = (
+        'Address,Packets,Bytes,Tx Packets,Tx Bytes,Rx Packets,Rx Bytes,Country,City,Latitude,Longitude,AS Number,AS Organization\n'
+        '"3.169.252.32",1407,1502693,1017,1464783,390,37910,US,"New York",40.7128,-74.0060,15169,"Google LLC"\n'
+        '"3.175.96.41",170,90357,90,63582,80,26775,US,"New York",40.7128,-74.0060,14618,"Amazon"\n'
+    )
+    ipv6_csv = (
+        'Address,Packets,Bytes,Tx Packets,Tx Bytes,Rx Packets,Rx Bytes,Country,City,Latitude,Longitude,AS Number,AS Organization\n'
+        '"fe80::1",5,450,0,0,5,450,US,"",0,0,0,""\n'
+    )
+    with open(os.path.join(dir_, "IPv4_csv.txt"), "w", encoding="utf-8") as f: f.write(ipv4_csv)
+    with open(os.path.join(dir_, "IPv6_csv.txt"), "w", encoding="utf-8") as f: f.write(ivp6:=ipv6_csv)
+
+
+def run_selftest() -> None:
+    tmpdir = tempfile.mkdtemp(prefix="netparse_")
+    try:
+        # Test A: tab-separated samples
+        _write_sample_tabs(tmpdir)
+        out = os.path.join(tmpdir, "test_out.xlsx")
+        sheets = parse_folder(tmpdir)
+        assert sheets and len(sheets) == 5, "Expected 5 parsed sheets from tab samples"
+        # Ensure TCP/UDP had Port dropped
+        d = {name: df for name, df in sheets}
+        if "TCP" in d:
+            assert "Port" not in d["TCP"].columns, "TCP sheet should not contain Port"
+        if "UDP" in d:
+            assert "Port" not in d["UDP"].columns, "UDP sheet should not contain Port"
+        write_sheets_to_excel(out, sheets)
+        assert os.path.isfile(out), "Output workbook not created"
+
+        # Test B: explicit file list yields same count
+        files = sorted(glob.glob(os.path.join(tmpdir, "*.txt")))
+        sheets2 = resolve_inputs(files, recursive=False, pattern="*.txt")
+        assert len(sheets2) == len(sheets) == 5, "Expected 5 sheets from samples (file-list path)"
+
+        # Test C: CSV Wireshark-like samples (with quotes + geo columns)
+        _write_sample_csv(tmpdir)
+        ipv4_path = os.path.join(tmpdir, "IPv4_csv.txt")
+        proto, df_ipv4 = parse_file(ipv4_path)
+        assert not df_ipv4.empty and proto == "IPv4"
+        # Geo/ASN columns should be removed for IPv4
+        for col in GEO_DROP_COLS:
+            assert col not in df_ipv4.columns, f"{col} should be dropped for IPv4"
+        # Core columns must exist and be numeric where expected
+        for col in ["Address", "Packets", "Bytes", "Tx Packets", "Tx Bytes", "Rx Packets", "Rx Bytes"]:
+            assert col in df_ipv4.columns
+        assert pd.api.types.is_numeric_dtype(df_ipv4["Packets"]) and pd.api.types.is_numeric_dtype(df_ipv4["Bytes"])  # coerced numerics
+
+        # IPv6 CSV case also drops geo/ASN
+        ipv6_path = os.path.join(tmpdir, "IPv6_csv.txt")
+        proto6, df_ipv6 = parse_file(ipv6_path)
+        assert not df_ipv6.empty and proto6 == "IPv6"
+        for col in GEO_DROP_COLS:
+            assert col not in df_ipv6.columns, f"{col} should be dropped for IPv6"
+
+        # Test D: empty directory returns [] for both helpers (no crash)
+        empty_dir = tempfile.mkdtemp(prefix="netparse_empty_")
+        try:
+            sheets_empty = parse_folder(empty_dir); assert sheets_empty == []
+            sheets_empty2 = resolve_inputs([empty_dir], recursive=False, pattern="*.txt"); assert sheets_empty2 == []
+        finally:
+            shutil.rmtree(empty_dir, ignore_errors=True)
+
+        print("SELFTEST OK →", out)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# -------------------------
+# Main
+# -------------------------
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+
+    if args.selftest:
+        run_selftest(); return 0
+    if args.gui:
+        return run_gui()
+
+    sheets = resolve_inputs(args.inputs, recursive=args.recursive, pattern=args.pattern)
+
+    if not sheets:
+        strat = args.on_empty
+        if strat == "gui":
+            print("[info] No files found via CLI; opening GUI to choose files…"); return run_gui()
+        if strat == "recursive" and not args.recursive:
+            sheets = resolve_inputs(args.inputs, recursive=True, pattern=args.pattern)
+            if not sheets:
+                _print_no_files_help(args.inputs, args.pattern, True); return 2
+        elif strat == "selftest":
+            print("[info] No files found; running built-in selftest instead."); run_selftest(); return 0
+        elif strat == "noop":
+            print("[info] No files found; nothing to do (noop).\n"); return 0
+        else:
+            _print_no_files_help(args.inputs, args.pattern, args.recursive); return 2
+
+    if args.list_only:
+        count = sum(len(df) for _, df in sheets)
+        print("Will build sheets (preview):")
+        for name, df in sheets: print(f"  - {name}: {len(df)} rows, {len(df.columns)} cols")
+        print(f"Total rows across sheets: {count}"); return 0
+
+    out = args.output
+    parent = os.path.dirname(os.path.abspath(out))
+    if parent and not os.path.exists(parent): os.makedirs(parent, exist_ok=True)
+
+    write_sheets_to_excel(out, sheets)
+    print(f"Saved workbook → {out}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
