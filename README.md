@@ -10,7 +10,11 @@ Convert network raw data (Wireshark-like TXT/CSV exports) into a polished Excel 
 - **Protocol-specific cleanup**:
   - IPv4/IPv6 sheets: drops `Country`, `City`, `Latitude`, `Longitude`, `AS Number`, `AS Organization`.
   - TCP/UDP sheets: drops `Port`.
-- **Excel output**: Writes real Excel Tables with header row frozen and sensible column widths.
+- **Excel augmentation (new build)**:
+  - If a `Packets` column is present, rows are sorted by per-row percentage of total packets (descending).
+  - Adds three computed columns to the right: `Total Packets`, `Total Packets in 100% (B/D *100)`, and `Top 20 %` (Pareto sum written once).
+  - Highlights the row that reaches the Pareto cutoff closest to 80% (within the 78–90% band when possible).
+  - Creates real Excel Tables, freezes the header row, and auto-fits column widths.
 - **Flexible input**: Convert a folder (with optional recursion) or one/more files; globs supported.
 - **Built-in self-test**: `--selftest` generates sample inputs and verifies output.
 
@@ -42,6 +46,9 @@ python network_converter.py data/ -r -o out.xlsx
 
 # Preview only (no Excel writing)
 python network_converter.py --list-only data/
+
+# If no files are found from CLI, open GUI automatically
+python network_converter.py --on-empty gui
 ```
 
 ### GUI
@@ -55,7 +62,12 @@ Pick one or more `.txt` files or a folder, choose the output `.xlsx`, and click 
 ### Inputs and outputs
 - **Supported inputs**: Ethernet / IPv4 / IPv6 / TCP / UDP dumps that include a header row. Files can be tab-separated or CSV (with quotes). The parser auto-detects delimiters and will skip an initial line that is just the protocol name.
 - **Sheet naming**: The protocol is inferred from the filename (case-insensitive). If ambiguous, a generic `Sheet` name is used. Duplicate sheet names get a numeric suffix.
-- **Output**: A single `.xlsx` workbook with one sheet per protocol. Each sheet is an Excel Table with a frozen header row and auto-fitted columns.
+- **Output**: A single `.xlsx` workbook with one sheet per protocol.
+  - Each sheet is an Excel Table with a frozen header row and auto-fitted columns.
+  - When a `Packets` (or `Packet`) column is present, the sheet is augmented with:
+    - Sorting by per-row % of packets (descending).
+    - Extra columns: `Total Packets`, `Total Packets in 100% (B/D *100)`, `Top 20 %` (Pareto value shown once).
+    - The row at the Pareto cutoff is highlighted.
 
 ### Command-line options
 
@@ -70,6 +82,8 @@ optional:
   -p, --pattern       Glob pattern for folder inputs (default: *.txt)
   --list-only         List what would be parsed and exit (no Excel writing)
   --selftest          Run built-in tests and exit
+  --on-empty {gui,recursive,error,selftest,noop}
+                      What to do if no files are found (default: gui)
   --on-empty {gui,recursive,error,selftest,noop}
                       What to do if no files are found (default: gui)
   --gui               Launch the Tkinter GUI instead of CLI
@@ -110,7 +124,11 @@ write_sheets_to_excel("network_data.xlsx", sheets)
 python network_converter.py --selftest
 ```
 
-Creates temporary sample inputs (tabs and CSV with quotes), writes an Excel workbook, and verifies key behaviors like column pruning and numeric coercion.
+Creates temporary sample inputs (tabs and CSV with quotes), writes an Excel workbook, and verifies key behaviors:
+- CSV parsing with quotes and delimiter detection
+- IPv4/IPv6: geo/ASN columns are dropped from output
+- TCP/UDP: `Port` column is dropped
+- Excel augmentation: added computed columns, Pareto sum, highlighted cutoff row
 
 ---
 
