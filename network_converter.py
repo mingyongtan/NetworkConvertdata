@@ -233,20 +233,58 @@ def write_sheets_to_excel(output_path: str, sheets: List[Tuple[str, pd.DataFrame
     from openpyxl.worksheet.table import Table as _Table, TableStyleInfo as _TSI
     from openpyxl import load_workbook as _lb
 
+    # --- Preprocess: sort by per-row % of Packets and compute Pareto sum (closest to 80 within 78..90)
+    prepped: List[Tuple[str, pd.DataFrame, Optional[float], Optional[int]]] = []
+    for sheet_name, df in sheets:
+        # find Packets column
+        pkt_col = None
+        for c in df.columns:
+            if NORMALIZE(str(c)) in ("packets", "packet"):
+                pkt_col = c; break
+        if pkt_col is None:
+            prepped.append((sheet_name, df, None, None))
+            continue
+        try:
+            s = pd.to_numeric(df[pkt_col], errors="coerce").fillna(0)
+        except Exception:
+            prepped.append((sheet_name, df, None, None))
+            continue
+        total = float(s.sum()) if len(s) else 0.0
+        if total <= 0:
+            prepped.append((sheet_name, df, None, None))
+            continue
+        pct = (s / total) * 100.0
+        # sort rows by pct desc
+        df_sorted = df.copy()
+        df_sorted["__pct_tmp__"] = pct.values
+        df_sorted = df_sorted.sort_values("__pct_tmp__", ascending=False, kind="mergesort").drop(columns=["__pct_tmp__"]).reset_index(drop=True)
+        # choose cumulative sum closest to 80 within [78,90]
+        pct_sorted = pct.sort_values(ascending=False).reset_index(drop=True)
+        cumsum = pct_sorted.cumsum()
+        band = cumsum[(cumsum >= 78) & (cumsum <= 90)]
+        if not band.empty:
+            best_idx = int((band - 80).abs().idxmin())
+            best = float(cumsum.iloc[best_idx])
+        else:
+            best_idx = int((cumsum - 80).abs().idxmin())
+            best = float(cumsum.iloc[best_idx])
+        prepped.append((sheet_name, df_sorted, round(best, 2), best_idx))
+
     # First write sheets with pandas
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         used = set()
-        for sheet_name, df in sheets:
+        for sheet_name, df_sorted, _best, _idx in prepped:
             name = sheet_name
             k = 2
             while name in used:
                 name = f"{sheet_name}_{k}"; k += 1
             used.add(name)
-            df.to_excel(writer, index=False, sheet_name=name)
+            df_sorted.to_excel(writer, index=False, sheet_name=name)
 
-    # Re-open and add the three computed columns + create Table
+    # Re-open and add the three computed columns + create Table; also write Pareto value
     wb = _lb(output_path)
-    for ws in wb.worksheets:
+    for (sheet_name, _df_sorted, best_sum, best_idx) in prepped:
+        ws = wb[sheet_name]
         # Identify header row and find the Packets column (accept 'Packet' or 'Packets')
         headers = [cell.value if cell.value is not None else "" for cell in ws[1]]
         norm = [NORMALIZE(str(h)) for h in headers]
@@ -286,19 +324,32 @@ def write_sheets_to_excel(output_path: str, sheets: List[Tuple[str, pd.DataFrame
         # Build formulas
         total_sum_formula = f"=SUM(${pkt_letter}$2:${pkt_letter}${max_row})"
         for r in range(2, max_row + 1):
-            # Total Packets =SUM([Packets])  → use absolute SUM over column
+            # Total Packets
             ws.cell(row=r, column=col_total).value = total_sum_formula
-            # Total Packets in 100% (B/D *100) → use row-wise Packets/Total * 100
+            # Total Packets in 100% (B/D *100)
             cell_pct = ws.cell(row=r, column=col_pct)
             cell_pct.value = f"=({pkt_letter}{r}/{total_letter}{r})*100"
             cell_pct.number_format = '0.00'
-            # Top 20 % → leave blank as requested
+            # Top 20 % left blank per-row; we'll set row 2 only below
+
+        # If we computed a best Pareto sum, write it once at row 2 of Top 20 %
+        if best_sum is not None and max_row >= 2:
+            cell_top = ws.cell(row=2, column=col_top20)
+            cell_top.value = best_sum
+            cell_top.number_format = '0.00'
+
+        # Highlight the row that reached the Pareto cutoff (index -> Excel row)
+        if best_idx is not None:
+            from openpyxl.styles import PatternFill
+            row_to_mark = int(best_idx) + 2  # 1 header + 1-based row index
+            fill = PatternFill(fill_type="solid", start_color="00FFF2CC", end_color="00FFF2CC")
+            for c in range(1, max_col + 3 + 1):  # include newly added 3 cols
+                ws.cell(row=row_to_mark, column=c).fill = fill
 
         # Create/resize the table to include new columns
         new_max_col = ws.max_column
         ref = f"A1:{_gcl(new_max_col)}{max_row}"
         disp = re.sub(r"[^A-Za-z0-9_]", "_", f"T_{ws.title}")[:31]
-        # Remove any existing table with the same name before re-adding
         if disp in ws.tables:
             del ws.tables[disp]
         t = _Table(displayName=disp, ref=ref)
