@@ -22,13 +22,16 @@ New in this revision
   `Longitude`, `AS Number`, `AS Organization`. Use of GUI/CLI is unchanged.
 - **TCP/UDP port drop**: For TCP and UDP sheets, the `Port` column is removed
   automatically during conversion.
+- **Pareto**: Rows sorted by per-row %; cumulative closest to 80 within 78–90
+  is written to `Top 20 %` (2 decimals) and the cutoff row is highlighted.
+- **Multi-folder GUI**: Add multiple folders; each becomes its own workbook.
 
 Supported inputs: Ethernet / IPv4 / IPv6 / TCP / UDP dumps with headers.
 Writes an Excel workbook with one sheet per protocol (real Excel Tables).
 
 Usage
 -----
-# GUI (click-pick files)
+# GUI (click-pick files or folders)
 python network_parse.py --gui
 
 # CLI — convert current folder
@@ -386,23 +389,25 @@ def run_gui() -> int:
             self.title("TXT → XLSX (Network Converter)")
             self.geometry("760x520")
             self.minsize(660, 460)
-            self.selected_paths: List[str] = []
+            self.selected_paths: List[str] = []      # files
+            self.selected_folders: List[str] = []    # folders (multi workbook mode)
             self._build_ui()
 
         def _build_ui(self):
             pad = {"padx": 10, "pady": 8}
 
             frm_top = ttk.Frame(self); frm_top.pack(fill="x", **pad)
-            ttk.Label(frm_top, text="1) Pick .txt files or a folder with them").pack(anchor="w")
+            ttk.Label(frm_top, text="1) Pick .txt files or add folders (one workbook per folder)").pack(anchor="w")
             btns = ttk.Frame(frm_top); btns.pack(fill="x", pady=4)
             ttk.Button(btns, text="Select .txt files", command=self.on_pick_files).pack(side="left")
             ttk.Button(btns, text="Select folder", command=self.on_pick_folder).pack(side="left", padx=8)
+            ttk.Button(btns, text="Add subfolders…", command=self.on_pick_parent_subfolders).pack(side="left")
             ttk.Button(btns, text="Clear list", command=self.on_clear).pack(side="left")
 
-            self.lst = tk.Listbox(self, height=8); self.lst.pack(fill="both", expand=False, **pad)
+            self.lst = tk.Listbox(self, height=10); self.lst.pack(fill="both", expand=False, **pad)
 
             frm_out = ttk.Frame(self); frm_out.pack(fill="x", **pad)
-            ttk.Label(frm_out, text="2) Output workbook (.xlsx):").pack(anchor="w")
+            ttk.Label(frm_out, text="2) Output (.xlsx for single workbook OR choose a folder for multi-folder mode):").pack(anchor="w")
             self.out_entry = ttk.Entry(frm_out)
             default_out = os.path.join(os.path.expanduser("~"), "Desktop", "network_data.xlsx")
             try: self.out_entry.insert(0, default_out)
@@ -423,7 +428,10 @@ def run_gui() -> int:
 
         def refresh_listbox(self):
             self.lst.delete(0, "end")
-            for p in self.selected_paths: self.lst.insert("end", p)
+            for d in self.selected_folders:
+                self.lst.insert("end", f"[DIR] {d}")
+            for p in self.selected_paths:
+                self.lst.insert("end", p)
 
         def on_pick_files(self):
             paths = filedialog.askopenfilenames(title="Select .txt files", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
@@ -435,17 +443,41 @@ def run_gui() -> int:
         def on_pick_folder(self):
             folder = filedialog.askdirectory(title="Select folder with .txt files")
             if not folder: return
-            found = sorted(glob.glob(os.path.join(folder, "*.txt")))
-            if not found:
-                messagebox.showinfo("No .txt files", "That folder has no .txt files."); return
-            self.selected_paths.extend(found)
-            self.selected_paths = list(dict.fromkeys(self.selected_paths))
+            if folder not in self.selected_folders:
+                self.selected_folders.append(folder)
             self.refresh_listbox()
 
+        def on_pick_parent_subfolders(self):
+            parent = filedialog.askdirectory(title="Select a parent folder (adds its immediate subfolders)")
+            if not parent: return
+            try:
+                subs = [os.path.join(parent, d) for d in os.listdir(parent) if os.path.isdir(os.path.join(parent, d))]
+            except Exception as e:
+                messagebox.showerror("Browse failed", str(e)); return
+            if not subs:
+                messagebox.showinfo("No subfolders", "That folder has no subfolders to add."); return
+            added = 0
+            for d in subs:
+                if d not in self.selected_folders:
+                    self.selected_folders.append(d); added += 1
+            self.refresh_listbox()
+            if added:
+                self.logln(f"➕ Added {added} subfolder(s) from: {parent}")
+            else:
+                self.logln("No new subfolders were added (duplicates skipped).")
+
         def on_clear(self):
-            self.selected_paths = []; self.refresh_listbox()
+            self.selected_paths = []
+            self.selected_folders = []
+            self.refresh_listbox()
 
         def on_pick_output(self):
+            # If folders were selected, choose an output directory to drop multiple workbooks
+            if self.selected_folders:
+                d = filedialog.askdirectory(title="Choose output folder for workbooks")
+                if d:
+                    self.out_entry.delete(0, "end"); self.out_entry.insert(0, d)
+                return
             initial = self.out_entry.get().strip() or "network_data.xlsx"
             path = filedialog.asksaveasfilename(title="Save Excel workbook", defaultextension=".xlsx", initialfile=os.path.basename(initial), filetypes=[("Excel Workbook", "*.xlsx")])
             if path:
@@ -453,9 +485,40 @@ def run_gui() -> int:
                 self.out_entry.delete(0, "end"); self.out_entry.insert(0, path)
 
         def on_convert(self):
-            if not self.selected_paths:
-                messagebox.showwarning("No files", "Add some .txt files first."); return
+            folder_mode = bool(self.selected_folders)
+            if not self.selected_paths and not folder_mode:
+                messagebox.showwarning("No input", "Add .txt files or folders first."); return
             out = self.out_entry.get().strip()
+
+            if folder_mode:
+                # Need an output directory
+                if not out or not os.path.isdir(out):
+                    d = filedialog.askdirectory(title="Choose output folder for workbooks")
+                    if not d:
+                        messagebox.showwarning("No output folder", "Please choose an output folder for the generated workbooks.")
+                        return
+                    out = d
+                total_workbooks = 0
+                for folder in self.selected_folders:
+                    try:
+                        sheets = parse_folder(folder)
+                        if not sheets:
+                            self.logln(f"⚠️ {os.path.basename(folder)} → no .txt files found (skipped)")
+                            continue
+                        name = os.path.basename(os.path.normpath(folder)) or "workbook"
+                        out_path = os.path.join(out, f"{name}.xlsx")
+                        write_sheets_to_excel(out_path, sheets)
+                        self.logln(f"✅ Saved {out_path}")
+                        total_workbooks += 1
+                    except Exception as e:
+                        self.logln(f"❌ {folder} → {e}")
+                if total_workbooks:
+                    messagebox.showinfo("Done", f"Created {total_workbooks} workbook(s) in: {out}")
+                else:
+                    messagebox.showwarning("Nothing created", "No workbooks were generated.")
+                return
+
+            # Single workbook from selected files (existing behavior)
             if not out:
                 messagebox.showwarning("No output", "Enter an output .xlsx path."); return
 
@@ -607,10 +670,8 @@ def run_selftest() -> None:
         ipv4_path = os.path.join(tmpdir, "IPv4_csv.txt")
         proto, df_ipv4 = parse_file(ipv4_path)
         assert not df_ipv4.empty and proto == "IPv4"
-        # Geo/ASN columns should be removed for IPv4
         for col in GEO_DROP_COLS:
             assert col not in df_ipv4.columns, f"{col} should be dropped for IPv4"
-        # Core columns must exist and be numeric where expected
         for col in ["Address", "Packets", "Bytes", "Tx Packets", "Tx Bytes", "Rx Packets", "Rx Bytes"]:
             assert col in df_ipv4.columns
         assert pd.api.types.is_numeric_dtype(df_ipv4["Packets"]) and pd.api.types.is_numeric_dtype(df_ipv4["Bytes"])  # coerced numerics
@@ -629,6 +690,19 @@ def run_selftest() -> None:
             sheets_empty2 = resolve_inputs([empty_dir], recursive=False, pattern="*.txt"); assert sheets_empty2 == []
         finally:
             shutil.rmtree(empty_dir, ignore_errors=True)
+
+        # Test E: multi-folder workflow (simulate GUI: one workbook per subfolder)
+        parent = os.path.join(tmpdir, "parent"); os.makedirs(parent, exist_ok=True)
+        subA = os.path.join(parent, "A"); subB = os.path.join(parent, "B")
+        os.makedirs(subA, exist_ok=True); os.makedirs(subB, exist_ok=True)
+        _write_sample_tabs(subA); _write_sample_tabs(subB)
+        out_dir = os.path.join(tmpdir, "out"); os.makedirs(out_dir, exist_ok=True)
+        for sub in (subA, subB):
+            sheets_sub = parse_folder(sub)
+            assert sheets_sub and len(sheets_sub) == 5
+            out_path = os.path.join(out_dir, os.path.basename(sub) + ".xlsx")
+            write_sheets_to_excel(out_path, sheets_sub)
+            assert os.path.isfile(out_path)
 
         print("SELFTEST OK →", out)
     finally:
